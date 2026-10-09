@@ -16,6 +16,17 @@ An automated personal finance bot for Telegram that extracts transaction intents
 - `requests`
 
 ## Setup & Running
-1. Clone the repository and install dependencies:
-   ```bash
-   pip install -r requirements.txt
+1## Prerequisites
+- Python 3.10 or higher
+- A Telegram account (to create a bot via [@BotFather](https://t.me/BotFather))
+- A Google Cloud project with Google Sheets API enabled (Service Account credentials)
+- A Google Gemini API key
+
+---
+
+## Getting Started
+
+### 1. Clone Repository
+```bash
+git clone [https://github.com/JavadGhoreyshi/your-repo-name.git](https://github.com/JavadGhoreyshi/your-repo-name.git)
+cd your-repo-name
