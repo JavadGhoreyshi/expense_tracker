@@ -27,3 +27,34 @@ An automated personal finance bot for Telegram that extracts transaction intents
 ```bash
 git clone https://github.com/JavadGhoreyshi/expense_tracker.git
 cd expense_tracker
+```
+
+### 2. Create & Activate Virtual Environment
+```bash
+# Windows
+python -m venv venv
+venv\Scripts\activate
+
+# Linux / macOS
+python3 -m venv venv
+source venv/bin/activate
+```
+
+### 3. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 4. Configuration
+1. Create a `.env` file in the root directory:
+   ```env
+   TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+   GEMINI_API_KEY="your_gemini_api_key"
+   ```
+2. Download your Google Service Account key from Google Cloud Console and save it as `credentials.json` in the project root.
+3. Share your Google Sheet (named `Expense_Tracker`) with the client email found inside `credentials.json` (grant Editor access).
+
+### 5. Run the Bot
+```bash
+python bot.py
+```
