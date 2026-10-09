@@ -25,5 +25,5 @@ An automated personal finance bot for Telegram that extracts transaction intents
 
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/JavadGhoreyshi/Telegram_expense_tracker.git
-cd Telegram_expense_tracker
+git clone https://github.com/JavadGhoreyshi/expense_tracker.git
+cd expense_tracker
