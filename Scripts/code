@@ -1,0 +1,381 @@
+import os
+import json
+import time
+from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+
+import requests
+from dotenv import load_dotenv
+import gspread
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from google import genai
+from google.genai import types
+
+# Load environment variables
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
+    raise ValueError("Telegram token or Gemini API key missing in environment variables.")
+
+MODEL_NAME = "gemini-3.6-flash"
+FALLBACK_RATE = 170000.0 # Used only if no exchange rate is recorded in the sheet
+
+# Initialize external service clients
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
+gc = gspread.service_account(filename="credentials.json")
+spreadsheet = gc.open("Expense_Tracker")
+sheet = spreadsheet.sheet1
+
+try:
+    daily_sheet = spreadsheet.worksheet("Daily_Summary")
+except gspread.exceptions.WorksheetNotFound:
+    daily_sheet = spreadsheet.add_worksheet(title="Daily_Summary", rows=200, cols=10)
+
+print("Google Sheets connection: OK")
+
+
+def ensure_summary_formulas():
+    """Rewrite summary formula cells to keep them dynamic."""
+    daily_sheet.update(
+        range_name="B2:B4",
+        values=[["=SUM(B7:B)"], ["=SUM(D7:D)"], ["=B1-B2"]],
+        value_input_option="USER_ENTERED",
+    )
+
+
+def setup_summary_sheet_if_needed():
+    """Initialize headers and structure for the Daily_Summary sheet."""
+    if not daily_sheet.acell("A1").value:
+        daily_sheet.update(
+            range_name="A1:A4",
+            values=[
+                ["Monthly Budget (IRR/Toman):"],
+                ["Total Monthly Spend (Toman):"],
+                ["Total Monthly Spend (USD):"],
+                ["Remaining Budget (Toman):"],
+            ],
+        )
+        daily_sheet.update(range_name="B1", values=[[10000000]])
+        daily_sheet.update(
+            range_name="A6:D6",
+            values=[["Date", "Daily Total (Toman)", "USD Rate (Toman)", "USD Equivalent ($)"]],
+        )
+    ensure_summary_formulas()
+
+
+setup_summary_sheet_if_needed()
+
+
+def to_float(val):
+    """Safely cast value to float; returns None on failure."""
+    try:
+        return float(str(val).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def norm(text: str) -> str:
+    """Normalize text characters and spacing for consistent matching."""
+    s = str(text or "").replace("ي", "ی").replace("ك", "ک").replace("\u200c", " ").lower()
+    return " ".join(s.split())
+
+
+def serial_to_date_str(val):
+    """Convert Google Sheets serial date number to YYYY-MM-DD string format."""
+    if isinstance(val, (int, float)):
+        return str(date(1899, 12, 30) + timedelta(days=int(val)))
+    return str(val).strip()
+
+
+def read_daily_rows():
+    """Retrieve recorded daily rows from summary sheet as [(date_str, rate), ...]."""
+    raw_data = daily_sheet.get("A7:D", value_render_option="UNFORMATTED_VALUE")
+    result = []
+    for r in raw_data:
+        if len(r) >= 3 and r[0] != "":
+            rate = to_float(r[2])
+            if rate and rate > 0:
+                result.append((serial_to_date_str(r[0]), rate))
+    return result
+
+
+def read_rate_map() -> dict:
+    return dict(read_daily_rows())
+
+
+def last_known_rate() -> float:
+    """Fetch the latest recorded exchange rate from sheet history."""
+    rows = read_daily_rows()
+    if rows:
+        return sorted(rows, key=lambda x: x[0])[-1][1]
+    return FALLBACK_RATE
+
+
+def get_usd_rate():
+    """Fetch current USD/USDT price from API; fall back to sheet history if unavailable."""
+    try:
+        res = requests.get("https://api.tetherland.com/currencies", timeout=5).json()
+        if "data" in res and "currencies" in res["data"]:
+            price = float(res["data"]["currencies"]["USDT"]["price"])
+            if price > 0:
+                return price, ""
+    except Exception as e:
+        print(f"Rate API request failed: {e}")
+
+    rate = last_known_rate()
+    return rate, f"Notice: Live rate unavailable. Fallback rate ({rate:,.0f} Toman) was applied."
+
+
+def call_gemini(prompt: str):
+    """Execute Gemini request with JSON output mode and retry mechanism."""
+    for attempt in range(3):
+        try:
+            response = ai_client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            )
+            return json.loads(response.text)
+        except Exception as e:
+            if ("503" in str(e) or "UNAVAILABLE" in str(e)) and attempt < 2:
+                time.sleep(2)
+                continue
+            raise
+
+
+def parse_intent(user_text: str) -> dict:
+    """Analyze natural language input and extract structured intent fields."""
+    today = date.today()
+    prompt = f"""
+    Today is {today} (Gregorian, YYYY-MM-DD).
+    User message: "{user_text}"
+
+    Identify the user intent and return a valid JSON object with the following schema:
+    - action: "add" | "delete" | "edit" | "list" | "unknown"
+    - date: YYYY-MM-DD or null. If relative terms (today, yesterday) or Persian calendar terms are used, normalize to Gregorian YYYY-MM-DD.
+    - row_number: integer row index if explicitly stated, otherwise null
+    - target_item: item name for delete/edit actions, otherwise null
+    - new_values: object containing updated keys (item, price_toman, category, date) for edit, otherwise null
+    - items: list of objects with [item, price_toman, category] keys for add action, otherwise []
+    """
+    result = call_gemini(prompt)
+    if isinstance(result, list):
+        result = {"action": "add", "items": result}
+    return result
+
+
+def valid_date_or_today(date_val) -> str:
+    try:
+        datetime.strptime(str(date_val), "%Y-%m-%d")
+        return str(date_val)
+    except (ValueError, TypeError):
+        return str(date.today())
+
+
+def rebuild_daily_summary(default_rate: float):
+    """Recalculate and update the Daily_Summary sheet based on primary records."""
+    rate_map = read_rate_map()
+    all_rows = sheet.get_all_values()
+
+    days = {}
+    for row in all_rows[1:]:
+        if len(row) < 6 or not row[0].strip():
+            continue
+        toman = to_float(row[3])
+        usd = to_float(row[5]) or 0.0
+        if toman is None:
+            continue
+        d = row[0].strip()
+        days.setdefault(d, [0.0, 0.0])
+        days[d][0] += toman
+        days[d][1] += usd
+
+    out = [[d, days[d][0], rate_map.get(d, default_rate), round(days[d][1], 2)] for d in sorted(days)]
+
+    daily_sheet.batch_clear(["A7:D"])
+    if out:
+        daily_sheet.update(range_name=f"A7:D{6 + len(out)}", values=out, value_input_option="RAW")
+    ensure_summary_formulas()
+
+
+def month_footer() -> str:
+    summary_values = daily_sheet.batch_get(["B2", "B3", "B4"], value_render_option="UNFORMATTED_VALUE")
+
+    def safe_float(block):
+        try:
+            return float(block[0][0])
+        except (IndexError, ValueError, TypeError):
+            return 0.0
+
+    spent_t = safe_float(summary_values[0])
+    spent_u = safe_float(summary_values[1])
+    remain = safe_float(summary_values[2])
+    return (
+        "------------------\n"
+        f"Total Monthly Spend: {spent_t:,.0f} Toman (${spent_u:,.2f})\n"
+        f"Remaining Budget: {remain:,.0f} Toman"
+    )
+
+
+def fmt_row(idx: int, row: list) -> str:
+    t = to_float(row[3]) or 0
+    return f"Row {idx}: {row[1]} ({row[2]}) - {t:,.0f} Toman - {row[0]}"
+
+
+def rows_of_day(all_rows: list, date_str: str):
+    return [(i, r) for i, r in enumerate(all_rows, start=1)
+            if i > 1 and len(r) >= 6 and r[0].strip() == date_str]
+
+
+def resolve_target(intent: dict, all_rows: list):
+    """Find target row index using either direct row number or item fuzzy matching."""
+    rn = intent.get("row_number")
+    if rn:
+        try:
+            rn = int(rn)
+        except (ValueError, TypeError):
+            rn = None
+    if rn:
+        if rn < 2 or rn > len(all_rows) or len(all_rows[rn - 1]) < 6 or not all_rows[rn - 1][0].strip():
+            return None, None, f"Row {rn} does not exist or is empty."
+        return rn, all_rows[rn - 1], None
+
+    date_str = valid_date_or_today(intent.get("date"))
+    target = norm(intent.get("target_item"))
+    day_rows = rows_of_day(all_rows, date_str)
+    if not day_rows:
+        return None, None, f"No expenses found for date: {date_str}."
+    if not target:
+        return None, None, "Item name required. Entries on that date:\n" + "\n".join(fmt_row(i, r) for i, r in day_rows)
+
+    matches = []
+    for i, r in day_rows:
+        name = norm(r[1])
+        if target in name or name in target or SequenceMatcher(None, target, name).ratio() >= 0.75:
+            matches.append((i, r))
+
+    if len(matches) == 1:
+        return matches[0][0], matches[0][1], None
+    if not matches:
+        return None, None, "Item not found. Recorded entries on that date:\n" + "\n".join(fmt_row(i, r) for i, r in day_rows)
+    return None, None, ("Multiple matches found. Specify row number:\n" + "\n".join(fmt_row(i, r) for i, r in matches))
+
+
+def do_add(intent: dict, usd_rate: float) -> str:
+    date_str = valid_date_or_today(intent.get("date"))
+    rate_for_day = read_rate_map().get(date_str, usd_rate)
+
+    rows, lines = [], []
+    for exp in intent.get("items") or []:
+        toman = to_float(exp.get("price_toman"))
+        if not toman or toman <= 0:
+            continue
+        item = exp.get("item") or "Unknown"
+        category = exp.get("category") or "General"
+        usd = round(toman / rate_for_day, 2)
+        rows.append([date_str, item, category, toman, toman * 10, usd])
+        lines.append(f"- {item} ({category}): {toman:,.0f} Toman (${usd})")
+
+    if not rows:
+        return "No valid transaction found in your input."
+
+    sheet.append_rows(rows, value_input_option="RAW")
+    rebuild_daily_summary(usd_rate)
+
+    return (f"USD Rate: {rate_for_day:,.0f} Toman\n"
+            f"Logged ({date_str}):\n\n" + "\n".join(lines) + "\n\n" + month_footer())
+
+
+def do_delete(intent: dict, usd_rate: float) -> str:
+    all_rows = sheet.get_all_values()
+    idx, row, err = resolve_target(intent, all_rows)
+    if err:
+        return err
+    sheet.delete_rows(idx)
+    rebuild_daily_summary(usd_rate)
+    return "Deleted:\n" + fmt_row(idx, row) + "\n\n" + month_footer()
+
+
+def do_edit(intent: dict, usd_rate: float) -> str:
+    new = intent.get("new_values") or {}
+    if not new:
+        return "Please specify fields to update (item, price, category, or date)."
+
+    all_rows = sheet.get_all_values()
+    idx, row, err = resolve_target(intent, all_rows)
+    if err:
+        return err
+
+    old_line = fmt_row(idx, row)
+    item = new.get("item") or row[1]
+    category = new.get("category") or row[2]
+    new_date = valid_date_or_today(new["date"]) if new.get("date") else row[0].strip()
+    new_toman = to_float(new.get("price_toman"))
+    toman = new_toman if new_toman and new_toman > 0 else to_float(row[3])
+
+    if new_toman or new.get("date"):
+        rate = read_rate_map().get(new_date, usd_rate)
+        usd = round(toman / rate, 2)
+    else:
+        usd = to_float(row[5]) or 0.0
+
+    sheet.update(
+        range_name=f"A{idx}:F{idx}",
+        values=[[new_date, item, category, toman, toman * 10, usd]],
+        value_input_option="RAW",
+    )
+    rebuild_daily_summary(usd_rate)
+    new_line = fmt_row(idx, [new_date, item, category, toman])
+    return f"Updated:\nPrevious: {old_line}\nUpdated: {new_line}\n\n" + month_footer()
+
+
+def do_list(intent: dict) -> str:
+    date_str = valid_date_or_today(intent.get("date"))
+    day_rows = rows_of_day(sheet.get_all_values(), date_str)
+    if not day_rows:
+        return f"No records found for date: {date_str}."
+    total = sum(to_float(r[3]) or 0 for _, r in day_rows)
+    return f"Records for {date_str}:\n" + "\n".join(fmt_row(i, r) for i, r in day_rows) + f"\n\nDaily Total: {total:,.0f} Toman"
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    status_msg = await update.message.reply_text("Processing request...")
+
+    try:
+        usd_rate, rate_note = get_usd_rate()
+        intent = parse_intent(user_text)
+        action = intent.get("action")
+
+        if action == "add":
+            reply = do_add(intent, usd_rate)
+        elif action == "delete":
+            reply = do_delete(intent, usd_rate)
+        elif action == "edit":
+            reply = do_edit(intent, usd_rate)
+        elif action == "list":
+            reply = do_list(intent)
+        else:
+            reply = "Command not recognized. Provide an expense entry or specify action (e.g., delete/edit)."
+
+        if rate_note:
+            reply += "\n\n" + rate_note
+        await status_msg.edit_text(reply)
+
+    except Exception as e:
+        await status_msg.edit_text(f"Error occurred:\n{e}")
+
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    print("Bot is listening for messages...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
